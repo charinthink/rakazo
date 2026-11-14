@@ -1,4 +1,5 @@
 """Offline tests for the page browser: the agent-browser wrapper and the saved-login, card and pay-token steps."""
+import contextlib
 import importlib.machinery
 import importlib.util
 import json
@@ -143,7 +144,12 @@ class FakeAgentBrowser:
         if command[:2] == ["is", "enabled"]:
             return {"enabled": command[2].lstrip("@") not in self.disabled}
         if name == "get" and command[1] == "box":
-            return self.boxes.get(command[2].lstrip("@"), {})
+            box = self.boxes.get(command[2].lstrip("@"), {})
+            # A list is the box as scrolling moves it: each read takes the next, and the last one stays.
+            if isinstance(box, list):
+                self.boxes[command[2].lstrip("@")] = box[1:] or box
+                return box[0]
+            return box
         if name == "get" and command[1] == "attr" and command[3] == "aria-disabled":
             return {"value": self.aria_disabled.get(command[2].lstrip("@"))}
         if name == "get" and command[1] == "attr":
@@ -478,6 +484,8 @@ class FakePurchases:
     on_desktop = None
     offscreen = set()
     fails = False
+    # When set, a box whose top is at or below this viewport height is still out of view.
+    viewport_height = None
 
     def __init__(self, port, target):
         if FakePurchases.fails:
@@ -493,7 +501,11 @@ class FakePurchases:
         return {"url": "https://shop.example.test/pay", "title": "Pay"}
 
     def click(self, box, scrolled):
-        if box.get("ref") in FakePurchases.offscreen and not scrolled:
+        if box is None:
+            return FakePurchases.shows
+        below = (FakePurchases.viewport_height is not None
+                 and float(box.get("y") or 0) >= FakePurchases.viewport_height)
+        if (box.get("ref") in FakePurchases.offscreen or below) and not scrolled:
             raise helper.Offscreen()
         return box.get("pay")
 
@@ -533,10 +545,23 @@ class PurchaseTest(unittest.TestCase):
         self.addCleanup(closed.stop)
         FakePurchases.host, FakePurchases.shows, FakePurchases.on_desktop = "shop.example.test", None, None
         FakePurchases.offscreen, FakePurchases.fails = set(), False
+        FakePurchases.viewport_height = None
 
     def act(self, actions, browser):
         with patch.object(helper.time, "sleep"), patch.object(helper, "QUIET_SECONDS", 0.0):
             return page(browser).act(actions)
+
+    @contextlib.contextmanager
+    def clock(self):
+        """A monotonic clock that advances only when the helper sleeps."""
+        now = [0.0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        with patch.object(helper.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(helper.time, "sleep", side_effect=sleep):
+            yield now
 
     def test_a_click_that_completes_a_purchase_is_refused_unless_the_user_approved_it(self):
         browser = pays(FakeAgentBrowser())
@@ -620,8 +645,34 @@ class PurchaseTest(unittest.TestCase):
     def test_a_control_out_of_view_is_scrolled_to_before_it_is_checked(self):
         browser = pays(FakeAgentBrowser())
         FakePurchases.offscreen = {"e8"}
-        self.assertEqual(self.act([{"kind": "click", "ref": "e8"}], browser)["error"], helper.PURCHASE_REFUSED)
+        FakePurchases.shows = PAY
+        with self.clock(), patch.object(helper, "QUIET_SECONDS", 0.0):
+            result = page(browser).act([{"kind": "click", "ref": "e8"}])
+        self.assertEqual(result["error"], helper.PURCHASE_REFUSED)
         self.assertEqual(browser.actions(), [["scrollintoview", "@e8"]])
+
+    def test_smooth_scrolling_does_not_approve_the_page_payment_for_an_offscreen_note(self):
+        browser = FakeAgentBrowser()
+        note = {"ref": "e8", "x": 10, "width": 40, "height": 20}
+        # Still below the fold on the read taken as soon as scrolling is requested, then it settles in view.
+        browser.boxes["e8"] = [{**note, "y": y} for y in (1500, 1500, 900, 400, 100, 100)]
+        FakePurchases.viewport_height = 713
+        FakePurchases.shows = {**PAY, "reason": "payment_page", "label": "Pay using Gift Card"}
+        with self.clock():
+            result = page(browser).purchase_check({"actions": [{"kind": "click", "ref": "e8"}]})
+        self.assertIsNone(result["purchase"])
+        self.assertEqual(browser.actions(), [["scrollintoview", "@e8"]])
+
+    def test_a_batch_shares_one_scroll_wait_budget_when_targets_remain_out_of_view(self):
+        browser = FakeAgentBrowser()
+        browser.boxes["e8"] = {"ref": "e8"}
+        FakePurchases.offscreen = {"e8"}
+        with self.clock() as now:
+            result = page(browser).purchase_check({"actions": [{"kind": "click", "ref": "e8"}] * 24})
+        self.assertIsNone(result["purchase"])
+        self.assertLessEqual(now[0], 8.01)
+        self.assertLessEqual(len(browser.actions()), 4)
+        self.assertFalse(any(command[0] == "click" for command in browser.actions()))
 
     def test_purchase_check_names_the_clicks_that_would_buy_and_presses_nothing(self):
         browser = pays(FakeAgentBrowser(), "e7")
